@@ -1,0 +1,172 @@
+name: Publish Static Site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'site/**'
+  workflow_dispatch:
+
+env:
+  # Site configuration (from template)
+  SITE_NAME: mysite5
+  AWS_REGION: us-east-1
+
+  # Bucket name follows convention: idp-{siteName}-static
+  BUCKET_NAME: idp-mysite5-static
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate:
+    name: Validate Site Content
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate HTML files
+        run: |
+          echo "Validating site content..."
+          if [ ! -f "site/index.html" ]; then
+            echo "Error: site/index.html not found"
+            exit 1
+          fi
+          echo "Site content validated successfully"
+
+  publish:
+    name: Publish to S3
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::948881762705:role/github-actions-ecr-push
+          aws-region: 
+
+      - name: Wait for bucket to exist
+        id: wait-bucket
+        run: |
+          echo "Waiting for bucket ${BUCKET_NAME} to be available..."
+          for i in {1..30}; do
+              if aws s3api head-bucket --bucket "${BUCKET_NAME}" 2>/dev/null; then
+                  echo "Bucket ${BUCKET_NAME} is ready!"
+                  echo "bucket_ready=true" >> $GITHUB_OUTPUT
+                  exit 0
+              fi
+              echo "Attempt $i/30 - Bucket not ready yet, waiting 10s..."
+              sleep 10
+          done
+          echo "Bucket ${BUCKET_NAME} not available after 5 minutes"
+          echo "bucket_ready=false" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Sync to S3
+        if: "steps.wait-bucket.outputs.bucket_ready == 'true'"
+        run: |
+          echo "Syncing site/ to s3://${BUCKET_NAME}..."
+          aws s3 sync site/ "s3://${BUCKET_NAME}" \
+            --delete \
+            --cache-control "max-age=31536000,public" \
+            --exclude "*.html" \
+            --exclude "*.json"
+
+          # HTML and JSON files with shorter cache
+          aws s3 sync site/ "s3://${BUCKET_NAME}" \
+            --cache-control "max-age=300,public" \
+            --include "*.html" \
+            --include "*.json"
+
+          echo "Sync complete!"
+
+      - name: Wait for CloudFront distribution (Deployed) and get ID
+        id: get-distribution
+        if: "steps.wait-bucket.outputs.bucket_ready == 'true'"
+        run: |
+          # Role must have cloudfront:ListDistributions, GetDistribution, CreateInvalidation (see docs/GITHUB-ACTIONS-IAM-PERMISSIONS.md).
+          # CloudFront is provisioned after the bucket; on first run it may not exist yet or be InProgress.
+          # Invalidation only works when Status=Deployed; we wait up to 10 min (20 x 30s) for Deployed.
+          MAX_ATTEMPTS=20
+          SLEEP_SEC=30
+          DIST_ID=""
+          i=0
+          while [ $i -lt $MAX_ATTEMPTS ]; do
+            i=$((i + 1))
+            RAW=$(aws cloudfront list-distributions \
+              --query "DistributionList.Items[*].[Id,Origins.Items[0].DomainName,Status]" \
+              --output text)
+            if [ -n "$RAW" ]; then
+              while read -r id domain cf_status; do
+                case "$domain" in
+                  *"${BUCKET_NAME}"*)
+                    if [ "$cf_status" = "Deployed" ]; then
+                      DIST_ID="$id"
+                      break
+                    fi
+                    echo "Attempt $i/$MAX_ATTEMPTS - Distribution ${id} found but status=${cf_status}, waiting ${SLEEP_SEC}s..."
+                    ;;
+                esac
+              done <<< "$RAW" || true
+            fi
+
+            if [ -n "$DIST_ID" ] && [ "$DIST_ID" != "None" ] && [ "$DIST_ID" != "NaN" ] && [[ "$DIST_ID" =~ ^[A-Z0-9]+$ ]]; then
+              echo "Found distribution: ${DIST_ID} (Deployed, attempt $i/$MAX_ATTEMPTS)"
+              echo "distribution_id=${DIST_ID}" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            DIST_ID=""
+            if [ $i -lt $MAX_ATTEMPTS ]; then
+              echo "Attempt $i/$MAX_ATTEMPTS - CloudFront distribution not ready yet, waiting ${SLEEP_SEC}s..."
+              sleep $SLEEP_SEC
+            fi
+          done
+          echo "CloudFront distribution not Deployed after $((MAX_ATTEMPTS * SLEEP_SEC))s (first run may still be deploying; next run will invalidate)."
+          echo "distribution_id=" >> $GITHUB_OUTPUT
+
+      - name: Invalidate CloudFront cache
+        if: "steps.get-distribution.outputs.distribution_id != ''"
+        run: |
+          DIST_ID="NaN"
+          if [ -z "$DIST_ID" ] || [ "$DIST_ID" = "None" ] || [ "$DIST_ID" = "NaN" ] || ! [[ "$DIST_ID" =~ ^[A-Z0-9]+$ ]]; then
+            echo "Skipping invalidation: invalid distribution_id (got: '${DIST_ID}')"
+            exit 0
+          fi
+          echo "Creating CloudFront invalidation for distribution ${DIST_ID}..."
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "$DIST_ID" \
+            --paths "/*" \
+            --query "Invalidation.Id" \
+            --output text)
+          echo "Invalidation created: ${INVALIDATION_ID}"
+          echo "Cache invalidation may take a few minutes to complete."
+
+      - name: Print site URL
+        if: "steps.get-distribution.outputs.distribution_id != ''"
+        run: |
+          DIST_ID="NaN"
+          if [ -z "$DIST_ID" ] || [ "$DIST_ID" = "None" ] || [ "$DIST_ID" = "NaN" ]; then
+            echo "Distribution ID not available; skip printing URL."
+            exit 0
+          fi
+          DOMAIN=$(aws cloudfront get-distribution \
+            --id "$DIST_ID" \
+            --query "Distribution.DomainName" \
+            --output text)
+          echo "----------------------------------------"
+          echo "Site published successfully!"
+          echo "URL: https://${DOMAIN}"
+          echo "----------------------------------------"

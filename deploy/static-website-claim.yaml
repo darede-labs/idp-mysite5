@@ -1,0 +1,19 @@
+# Crossplane Claim for Static Website
+# Creates: S3 Bucket + CloudFront Distribution
+#
+# After provisioning, check status:
+#   kubectl get staticwebsite mysite5 -n mysite5 -o yaml
+apiVersion: platform.darede.io/v1alpha1
+kind: StaticWebsite
+metadata:
+  name: mysite5
+  namespace: mysite5
+  labels:
+    app.kubernetes.io/name: mysite5
+    app.kubernetes.io/managed-by: crossplane
+spec:
+  siteName: mysite5
+  region: us-east-1
+  priceClass: PriceClass_100
+  indexDocument: index.html
+  errorDocument: error.html
