@@ -1,0 +1,11 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: mysite5
+  description: asdasd
+  annotations:
+    github.com/project-slug: darede-labs/idp-mysite5
+spec:
+  type: website
+  lifecycle: experimental
+  owner: group:default/asdasda
